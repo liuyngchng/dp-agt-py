@@ -6,12 +6,12 @@
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/lib/font-awesome.all.min.css">
     <link rel="stylesheet" href="/static/css/admin.css">
-    <title id="pageTitle">dp_agt_py 管理平台</title>
+    <title id="pageTitle">dp-agt-py 管理平台</title>
 </head>
 <body>
 <div class="container">
     <header>
-        <h1><i class="fas fa-robot"></i> <span id="sysNameHeader">dp_agt_py 管理平台</span></h1>
+        <h1><i class="fas fa-robot"></i> <span id="sysNameHeader">dp-agt-py 管理平台</span></h1>
         <p>系统管理 &middot; 运行监控</p>
         <button class="logout-btn" onclick="doLogout()"><i class="fas fa-sign-out-alt"></i> 退出登录</button>
     </header>
@@ -748,7 +748,7 @@ async function loadSysConfig() {
         const res = await fetch(API + '/sys-config');
         const json = await res.json();
         if (json.data) {
-            const sysName = json.data.sys.name || 'dp_agt_py';
+            const sysName = json.data.sys.name || 'dp-agt-py';
             document.getElementById('sysName').value = sysName;
             // 同步更新页面标题和 header
             const title = sysName + ' 管理平台';

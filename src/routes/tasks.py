@@ -429,7 +429,7 @@ def _render_timeline_html(task: TaskLog, events: list[dict], linkid: str) -> str
     </div>
   </div>
   <div class="tl">{items_html}</div>
-  <div class="foot">Powered by dp_agt_py</div>
+  <div class="foot">Powered by dp-agt-py</div>
 </div>
 </body>
 </html>"""

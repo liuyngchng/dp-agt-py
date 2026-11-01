@@ -152,7 +152,7 @@ curl -s -k --noproxy '*' -w'\\n' -X GET '{doc_audit_url}/task?id=<审稿task_id>
 - `data.tokens`: Token 消耗统计
 """
 
-    return f"""# dp_agt_py 工作区
+    return f"""# dp-agt-py 工作区
 
 你是电子公文处理智能体，运行在这个临时工作目录中。
 

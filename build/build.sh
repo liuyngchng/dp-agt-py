@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dp_agt_py Docker 镜像构建脚本
+# dp-agt-py Docker 镜像构建脚本
 #
 # Pip 离线安装（网络差时推荐）:
 #   ./build.sh pip_download_dir=/path/to/wheels
@@ -11,7 +11,7 @@ BUILD_START=$(date +%s)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-IMAGE_NAME="${IMAGE_NAME:-dp_agt_py}"
+IMAGE_NAME="${IMAGE_NAME:-dp-agt-py}"
 PIP_OFFLINE_STAGING="${SCRIPT_DIR}/.pip-offline"
 
 # ── Usage ────────────────────────────────────────────────────────
@@ -259,7 +259,7 @@ else
     openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
       -keyout "$PERSIST_KEY_FILE" \
       -out "$PERSIST_CERT_FILE" \
-      -subj "/C=CN/O=dp_agt_py/CN=localhost" \
+      -subj "/C=CN/O=dp-agt-py/CN=localhost" \
       -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" 2>/dev/null
   else
     echo "[build] 警告: 未找到 openssl，跳过证书生成，服务将使用 HTTP"

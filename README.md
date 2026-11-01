@@ -1,4 +1,4 @@
-# dp_agt_py — 电子公文智能处理 Agent
+# dp-agt-py — 电子公文智能处理 Agent
 
 基于 FastAPI + Claude Agent SDK (Python) 实现的电子公文智能处理网关。
 功能涵盖：接口模板管理、提示词渲染、异步任务队列、Agent SDK 调用、回调投递与重试、管理后台。
@@ -37,7 +37,7 @@
 
 ```bash
 # 1. 安装依赖
-cd /home/rd/workspace/dp_agt_py
+cd /home/rd/workspace/dp-agt-py
 pip install -e .   # 或 python3 -m venv .venv && .venv/bin/pip install -e .
 
 # 2. 准备配置
@@ -61,7 +61,7 @@ curl http://localhost:20001/health
 ## 目录结构
 
 ```
-dp_agt_py/
+dp-agt-py/
 ├── pyproject.toml
 ├── Dockerfile
 ├── src/

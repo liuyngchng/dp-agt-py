@@ -42,7 +42,7 @@ def create_app() -> tuple[FastAPI, Config]:
     ensure_dirs(cfg)
 
     log = init_logger(cfg.sys.data_dir, cfg.server.debug)
-    log.info("==== dp_agt_py starting ====")
+    log.info("==== dp-agt-py starting ====")
     log.info(
         "config_loaded server=%s sys=%s llm=%s doc_audit=%s",
         cfg.server.__dict__,
@@ -63,7 +63,7 @@ def create_app() -> tuple[FastAPI, Config]:
     init_task_queue(cfg)
     log.info("task_queue_ready")
 
-    app = FastAPI(title="dp_agt_py 管理后台", docs_url=None, redoc_url=None)
+    app = FastAPI(title="dp-agt-py 管理后台", docs_url=None, redoc_url=None)
 
     # ============================================================
     # 公开路由（无需认证）
@@ -79,7 +79,7 @@ def create_app() -> tuple[FastAPI, Config]:
     # 公开系统信息（登录页用，无需认证）
     @app.get("/api/info")
     async def api_info():
-        name = config_store.get("sys.name") or "dp_agt_py"
+        name = config_store.get("sys.name") or "dp-agt-py"
         return {"code": 0, "data": {"sys_name": name}}
 
     # 静态资源（公开，登录页也需要）

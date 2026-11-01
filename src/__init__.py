@@ -1,1 +1,1 @@
-"""dp_agt_py - 电子公文智能处理 Agent (Python版)."""
+"""dp-agt-py - 电子公文智能处理 Agent (Python版)."""
