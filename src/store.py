@@ -14,6 +14,7 @@ import uuid6
 
 from .time import fmt_local_ts, now_readable, now_ts
 from .types import AgentInterface, TaskLog, TaskStatus, User, Session, SessionStatus
+from .crypto import init_crypto, encrypt_value, decrypt_value, EncryptedValue
 
 _db_path: str = ""
 
@@ -22,6 +23,9 @@ def init_store(data_dir: str) -> None:
     """初始化数据库连接和表结构（同步，启动时执行）。"""
     global _db_path
     _db_path = str(Path(data_dir) / "app.db")
+
+    # ── crypto ──
+    init_crypto(data_dir)
 
     with _connect() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
@@ -84,6 +88,16 @@ def init_store(data_dir: str) -> None:
               key   TEXT PRIMARY KEY,
               value TEXT NOT NULL,
               note  TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS prompt_config (
+              key         TEXT PRIMARY KEY,
+              value_enc   TEXT NOT NULL DEFAULT '',
+              iv          TEXT NOT NULL DEFAULT '',
+              tag         TEXT NOT NULL DEFAULT '',
+              is_secret   INTEGER NOT NULL DEFAULT 0,
+              note        TEXT DEFAULT '',
+              updated_at  TEXT
             );
         """)
 
@@ -197,6 +211,45 @@ def _seed_defaults(conn: sqlite3.Connection) -> None:
             "INSERT INTO users (username, password_hash, role, note, must_change_pwd, user_version, created_at, created_ts) VALUES (?,?,?,?,?,?,?,?)",
             ("admin", _hash_password("admin"), 1, "默认管理员", 1, 1, now_readable(), now_ts()),
         )
+
+
+# ============================================================
+# 从 prompts/ 目录同步 agent_interfaces
+# ============================================================
+
+def sync_interfaces_from_prompts(
+    prompt_files: list[dict],
+) -> None:
+    """从 prompts/ 目录自动发现 agent_interfaces 并同步到 DB。"""
+    with _connect() as conn:
+        existing_paths = {
+            r["path"] for r in conn.execute("SELECT path FROM agent_interfaces").fetchall()
+        }
+        now = now_readable()
+        ts = now_ts()
+
+        for pf in prompt_files:
+            path = pf["path"]
+            name = pf["name"]
+            if path in existing_paths:
+                # 已有则更新 name
+                conn.execute(
+                    "UPDATE agent_interfaces SET name = ?, updated_at = ?, updated_ts = ? WHERE path = ?",
+                    (name, now, ts, path),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO agent_interfaces (id, name, path, prompt, created_at, updated_at, created_ts, updated_ts) VALUES (?,?,?,?,?,?,?,?)",
+                    (uuid6.uuid7().hex, name, path, "", now, now, ts, ts),
+                )
+
+        # 删除磁盘上已经不存在的路径
+        disk_paths = {pf["path"] for pf in prompt_files}
+        for ep in existing_paths:
+            if ep not in disk_paths:
+                conn.execute("DELETE FROM agent_interfaces WHERE path = ?", (ep,))
+
+        conn.commit()
 
 
 def _hash_password(password: str) -> str:
@@ -389,6 +442,114 @@ def _default_dispatch_review_prompt() -> str:
 - rdCLI 核稿意见原样保留到 `result_text` 的"体例格式审核"章节中，不要改写
 - 如果某维度未发现问题，在报告中写"未发现问题"即可，不要留空
 - 不要输出任何其他内容，只输出 JSON"""
+
+
+# ============================================================
+# Prompt Config — 加密 KV（上传 CSV 落盘）
+# ============================================================
+
+class PromptConfigStore:
+    """加密 KV 配置存储（CSV 上传的值加密入库）。"""
+
+    def import_rows(
+        self, rows: list[dict]
+    ) -> int:
+        """批量导入行。key 以 .token/.key/.secret/.password 或 _token/_key/_secret/_password 结尾的视为敏感。"""
+        count = 0
+        now = now_readable()
+        with _connect() as conn:
+            for row in rows:
+                key = row["key"]
+                value = row["value"]
+                is_secret = row.get("is_secret", False)
+                note = row.get("note", "")
+                try:
+                    enc = encrypt_value(value)
+                except Exception:
+                    continue
+                conn.execute(
+                    "INSERT INTO prompt_config (key, value_enc, iv, tag, is_secret, note, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value_enc=excluded.value_enc, iv=excluded.iv, "
+                    "tag=excluded.tag, is_secret=excluded.is_secret, note=excluded.note, updated_at=excluded.updated_at",
+                    (key, enc.enc, enc.iv, enc.tag, 1 if is_secret else 0, note, now),
+                )
+                count += 1
+            conn.commit()
+        return count
+
+    def get_plain(self, key: str) -> str | None:
+        """获取单个 key 的明文。"""
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT value_enc, iv, tag FROM prompt_config WHERE key = ?", (key,)
+            ).fetchone()
+        if not row or not row["value_enc"]:
+            return None
+        return decrypt_value(row["value_enc"], row["iv"], row["tag"])
+
+    def list(self, reveal: bool = False) -> list[dict]:
+        """列出所有 key。敏感项默认脱敏，公开项直接明文；reveal=True 时敏感项也明文。"""
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value_enc, iv, tag, is_secret, note, updated_at FROM prompt_config ORDER BY key"
+            ).fetchall()
+        result = []
+        for r in rows:
+            plain = decrypt_value(r["value_enc"], r["iv"], r["tag"]) if r["value_enc"] else ""
+            is_secret = r["is_secret"] == 1
+            value = (
+                _mask_value(plain) if (is_secret and not reveal)
+                else (plain or "<解密失败>")
+            ) if is_secret else plain or ""
+            result.append({
+                "key": r["key"],
+                "value": value,
+                "is_secret": is_secret,
+                "note": r["note"] or "",
+                "updated_at": r["updated_at"],
+            })
+        return result
+
+    def get_all_plain(self) -> dict[str, str]:
+        """获取所有 key→明文映射（内部渲染用）。"""
+        m: dict[str, str] = {}
+        with _connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value_enc, iv, tag FROM prompt_config"
+            ).fetchall()
+        for r in rows:
+            if not r["value_enc"]:
+                continue
+            plain = decrypt_value(r["value_enc"], r["iv"], r["tag"])
+            if plain is not None:
+                m[r["key"]] = plain
+        return m
+
+    def clear_all(self) -> None:
+        """清空所有配置。"""
+        with _connect() as conn:
+            conn.execute("DELETE FROM prompt_config")
+            conn.commit()
+
+    def count(self) -> int:
+        with _connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS c FROM prompt_config").fetchone()
+        return row["c"] if row else 0
+
+    def list_keys(self) -> list[str]:
+        """获取所有 key 名，用于占位符校验。"""
+        with _connect() as conn:
+            rows = conn.execute("SELECT key FROM prompt_config ORDER BY key").fetchall()
+        return [r["key"] for r in rows]
+
+
+def _mask_value(plain: str | None) -> str:
+    if not plain:
+        return ""
+    if len(plain) <= 4:
+        return "****"
+    return plain[:2] + "****" + plain[-2:]
 
 
 # ============================================================
@@ -807,6 +968,7 @@ task_logs_store = TaskLogsStore()
 sessions_store = SessionsStore()
 users_store = UsersStore()
 config_store = ConfigStore()
+prompt_config_store = PromptConfigStore()
 
 # 公开密码工具函数
 hash_password = _hash_password

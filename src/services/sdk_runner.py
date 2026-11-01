@@ -3,7 +3,7 @@ Claude Agent SDK 调用封装
 
 - 工作目录：data/tasks/<sanitize(linkid)>/
 - 支持 session 复用：通过 resume 参数恢复历史对话
-- CLAUDE.md 仅首次写入，resume 时不再覆盖（SDK snapshot 机制）
+- CLAUDE.md 从 prompts/claude-md.md 模板动态生成，仅首次写入
 """
 
 from __future__ import annotations
@@ -35,6 +35,16 @@ def _sanitize_linkid(s: str) -> str:
     return re.sub(r'[/\\:*?"<>|]', '_', s)
 
 
+def _deep_get(obj: dict, path: str) -> Any:
+    parts = path.split(".")
+    cur: Any = obj
+    for p in parts:
+        if cur is None or not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+
 def _build_env(cfg: Config) -> dict[str, str | None]:
     """根据 LLM 配置构建子进程环境变量。"""
     env: dict[str, str | None] = {}
@@ -62,144 +72,162 @@ def _build_env(cfg: Config) -> dict[str, str | None]:
     if llm.timeout_ms:
         env["API_TIMEOUT_MS"] = str(llm.timeout_ms)
 
-    # 文件下载 Token
-    if cfg.sys.file_url_token:
-        env["FILE_URL_TOKEN"] = cfg.sys.file_url_token
+    # 文件下载 Token（优先从 CSV prompt_config 读取）
+    from ..store import prompt_config_store
+    file_url_token = (
+        prompt_config_store.get_plain("doc.file_url_token")
+        or prompt_config_store.get_plain("sys.file_url_token")
+        or cfg.sys.file_url_token
+    )
+    if file_url_token:
+        env["FILE_URL_TOKEN"] = file_url_token
     else:
         env["FILE_URL_TOKEN"] = ""
 
     # 文档审核服务 Token
-    if cfg.doc_audit.token:
-        env["DOC_AUDIT_TOKEN"] = cfg.doc_audit.token
+    doc_audit_token = (
+        prompt_config_store.get_plain("doc_audit.token")
+        or cfg.doc_audit.token
+    )
+    if doc_audit_token:
+        env["DOC_AUDIT_TOKEN"] = doc_audit_token
     else:
         env["DOC_AUDIT_TOKEN"] = ""
 
-    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
-    env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "0"
-    env["CLAUDE_CODE_AUTO_MODE_SERVER"] = "0"
+    env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1" if llm.disable_nonessential_traffic else "0"
+    env["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "1" if llm.attribution_header else "0"
+    env["CLAUDE_CODE_AUTO_MODE_SERVER"] = "1" if llm.auto_mode_server else "0"
 
     return env
 
 
-def _build_claude_md(
-    doc_util_url: str,
-    renew_file_url_api: str,
-    doc_audit_url: str,
-    server_port: int,
-) -> str:
-    wps_section = ""
-    if renew_file_url_api:
-        wps_section = f"""
-## 文件下载回退（WPS 接口）
+def _load_all_prompt_files() -> dict[str, str]:
+    """加载 prompts/ 目录下的所有模板文件（含 sections/）。"""
+    files: dict[str, str] = {}
+    prompts_dir = Path.cwd() / "prompts"
+    if not prompts_dir.exists():
+        return files
 
-如果通过请求中的 `file_url` 直接下载文件失败（超时、403、连接被拒等），
-可以尝试通过 WPS 接口用 `file_id` 重新获取新的下载链接。
+    def walk(d: Path, prefix: str) -> None:
+        if not d.exists():
+            return
+        for entry in sorted(d.iterdir()):
+            full = d / entry.name
+            rel = prefix + entry.name
+            if entry.is_dir():
+                walk(full, rel + "/")
+            elif entry.name.endswith(".md"):
+                try:
+                    files[rel] = full.read_text(encoding="utf-8")
+                except Exception:
+                    pass
 
-接口令牌通过环境变量 `FILE_URL_TOKEN` 提供，**不要在日志或屏幕上输出此 Token**。
+    walk(prompts_dir, "")
+    return files
 
-```bash
-curl -s -k --noproxy '*' -w'\\n' -X POST '{renew_file_url_api}' \\
-  -H 'Content-Type: application/json' \\
-  -H "Authorization: Bearer $FILE_URL_TOKEN" \\
-  -d '{{"fileId": "<文件ID>", "getFileUrlType": "download"}}' | jq -r '.data'
-```
 
-步骤：
-1. 从请求 JSON 的 `files[].file_id` 字段获取文件 ID
-2. 用上述命令获取新下载 URL（`jq -r '.data'` 返回的就是 file_url）
-3. 用新的 URL 重新 curl 下载文件
-4. 如果仍然失败，标记 `need_human: true` 并在 `fail_reason` 中说明原因
-"""
+def _load_prompt_file(relative_path: str) -> str | None:
+    """从 prompts 目录加载模板文件。"""
+    candidates = [
+        Path.cwd() / "prompts",
+    ]
+    for d in candidates:
+        p = d / relative_path
+        if p.exists():
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+    return None
 
-    doc_audit_section = ""
-    if doc_audit_url:
-        doc_audit_section = f"""
-## 文档审核服务（rdCLI 审稿）
 
-同网络下有一个文档审核服务，可对 .docx 文档进行体例格式校对（错别字、标点、语法、逻辑、GB/T 9704-2012 党政公文规范等）。服务为异步模式，**提交后通过轮询获取结果**。
-
-接口令牌通过环境变量 `DOC_AUDIT_TOKEN` 提供，**不要在日志或屏幕上输出此 Token**。
-
-### 提交审稿任务
-
-```bash
-curl -s -k --noproxy '*' -w'\\n' -X POST '{doc_audit_url}' \\
-  -H "x-api-key: $DOC_AUDIT_TOKEN" \\
-  -F "file=@正文.docx" \\
-  -F "callback_url=http://localhost:{server_port}/api/dev/null" \\
-  -F "additional_instructions=请严格按 GB/T 9704-2012 党政机关公文格式标准进行校对"
-```
-
-返回 JSON:
-- `task_id`: 审稿任务 ID
-- `data.status`: 初始为 `"pending"`
-
-### 轮询获取结果
-
-```bash
-curl -s -k --noproxy '*' -w'\\n' -X GET '{doc_audit_url}/task?id=<审稿task_id>' \\
-  -H "x-api-key: $DOC_AUDIT_TOKEN" | jq '.'
-```
-
-当 `data.status` 为 `"completed"` 时，`data.result_text` 即为 Markdown 格式的核稿意见。
-如果 `data.status` 仍为 `"pending"` 或 `"processing"`，等待 15 秒后重新轮询，最多等待 5 分钟。
-
-返回 JSON（已完成后）:
-- `code`: 0 成功，2001 失败，2002 已撤销
-- `data.status`: `"completed"` | `"failed"` | `"cancelled"`
-- `data.result_text`: 核稿意见全文（Markdown），仅 completed 时有
-- `data.file_name`: 文件名
-- `data.tokens`: Token 消耗统计
-"""
-
-    return f"""# dp-agt-py 工作区
+async def _build_claude_md(cfg: Config) -> str:
+    """从 prompts/claude-md.md 模板 + CSV 配置 + sections 构建 CLAUDE.md。"""
+    template = _load_prompt_file("claude-md.md") or ""
+    if not template:
+        # 兜底默认模板
+        template = f"""# dp-agt-py 工作区
 
 你是电子公文处理智能体，运行在这个临时工作目录中。
 
 ## 文件下载
 - 对方传递的 JSON 中的文件 URL 已开放白名单，无需认证
-- 如果文件 URL 需要认证，可用环境变量 `FILE_URL_TOKEN`（Bearer Token）下载：
+- 如果文件 URL 需要认证，可用环境变量 FILE_URL_TOKEN（Bearer Token）下载：
   `curl -s -k --noproxy '*' -w'\\n' -H "Authorization: Bearer $FILE_URL_TOKEN" '<file_url>' -o 文件名`
 - 用 curl 下载文件到当前工作目录
-{wps_section}
+
 ## 文档解析服务
 
 同网络下有一个文档解析服务，可将 PDF / DOCX / .doc（旧版 Word）转为纯文本，
-同时自动检测印章。文字版和扫描版 PDF 均支持。
+同时自动检测印章。
 
 ```bash
-curl -s -k --noproxy '*' -w'\\n' -X POST {doc_util_url}/extract/txt \\
+curl -s -k --noproxy '*' -w'\\n' -X POST {cfg.sys.doc_util_url}/extract/txt \\
   -F "file=@文件名" | jq '.'
 ```
 
 返回 JSON:
-- `text`: 提取的全部文本
-- `has_seal`: 是否检测到印章 (true/false)
-- `seal_text`: 印章文字列表，如 ["北京XX科技有限公司", "财务专用章"]
-- `ocr_confidence`: OCR 置信度 0.0–1.0 (1.0=纯文字提取，无需 OCR)
+- text: 提取的全部文本
+- has_seal: 是否检测到印章 (true/false)
+- seal_text: 印章文字列表
+- ocr_confidence: OCR 置信度 0.0–1.0
 
-示例:
-```bash
-curl -s -k --noproxy '*' -w'\\n' -X POST {doc_util_url}/extract/txt \\
-  -F "file=@document.pdf" | jq -r '.text'
-```
-
-注意事项:
-- 该服务使用自签名 HTTPS 证书，务必带 `-k` 跳过证书校验
-- 用 `--noproxy '*'` 绕过代理直连
-- 对下载的每个文件都调用此服务提取文本
-- 文件大小上限 64MB
-{doc_audit_section}
 ## 行为规范
-1. 所有文本内容（fail_reason、opinion_text、desc 等）必须使用简体中文
+1. 所有文本内容必须使用简体中文
 2. 严格按提示词要求的 JSON Schema 输出
 3. 最终结果用 ```json 代码块包裹
 4. json 代码块之外不要输出任何其他内容
-5. 如果下载失败或文件无法识别，在 JSON 中标记 need_human: true
-6. 如果本次请求涉及某个文件，但当前上下文里没有该文件的文本内容（例如历史被压缩、或这是新文件），
-   按"文件下载"章节自行 curl 下载，并调用文档解析服务提取文本后再分析。
-   若上下文里已有该文件的文本，直接复用，无需重复下载。
-"""
+5. 下载失败或文件无法识别，在 JSON 中标记 need_human: true
+6. 如果请求涉及某个文件但上下文里没有其文本内容，按"文件下载"章节自行 curl 下载"""
+        return template
+
+    # ── 从 prompt_config（CSV）+ cfg.yml 系统级收集所有值 ──
+    from ..store import prompt_config_store
+    cfg_vals = prompt_config_store.get_all_plain()
+
+    # 系统级占位符（不在 CSV 中）
+    cfg_vals["server.port"] = str(cfg.server.port)
+    cfg_vals["server.self_ip"] = str(cfg.server.self_ip or "")
+    cfg_vals["sys.doc_util_url"] = cfg.sys.doc_util_url
+    cfg_vals["doc_util_url"] = cfg.sys.doc_util_url
+
+    # ── 预加载所有 sections 文件 ──
+    all_sections = _load_all_prompt_files()
+
+    # ── 替换 {{section:name:trigger_key}} 占位符 ──
+    def _replace_section(m: re.Match[str]) -> str:
+        name = m.group(1)
+        trigger_key = m.group(2).strip()
+        trigger_val = cfg_vals.get(trigger_key)
+        if not trigger_val:
+            return ""  # 触发 key 没值 → 整段不渲染
+        section_key = "sections/" + name + ".md"
+        section_content = all_sections.get(section_key)
+        if section_content is None:
+            section_content = all_sections.get(name + ".md")
+        # sections 内部也有占位符，需要再做一轮替换
+        if section_content:
+            section_content = re.sub(
+                r"\{\{([\w.]+)\}\}",
+                lambda m2: cfg_vals.get(m2.group(1).strip(), m2.group(0)),
+                section_content,
+            )
+        return section_content or ""
+
+    template = re.sub(
+        r"\{\{section:(\w+):([\w.]+)\}\}",
+        _replace_section,
+        template,
+    )
+
+    # ── 替换剩余 {{key}} 占位符（key 支持含点号） ──
+    template = re.sub(
+        r"\{\{([\w.]+)\}\}",
+        lambda m: cfg_vals.get(m.group(1).strip(), m.group(0)),
+        template,
+    )
+
+    return template
 
 
 @dataclass
@@ -235,12 +263,7 @@ async def run_agent(
     # CLAUDE.md 仅首次写入（resume 时不覆盖，因为 SDK snapshot 已固化 system prompt）
     if not resume_session_id:
         (work_dir / "CLAUDE.md").write_text(
-            _build_claude_md(
-                cfg.sys.doc_util_url,
-                cfg.sys.renew_file_url_api,
-                cfg.doc_audit.api_url,
-                cfg.server.port,
-            ),
+            await _build_claude_md(cfg),
             encoding="utf-8",
         )
 
@@ -266,12 +289,7 @@ async def run_agent(
             cwd=str(work_dir),
             allowed_tools=["Bash", "Read", "Write", "Glob", "Grep", "WebSearch", "WebFetch"],
             permission_mode="dontAsk",
-            system_prompt=_build_claude_md(
-                cfg.sys.doc_util_url,
-                cfg.sys.renew_file_url_api,
-                cfg.doc_audit.api_url,
-                cfg.server.port,
-            ),
+            system_prompt=await _build_claude_md(cfg),
             max_buffer_size=10 * 1024 * 1024,
             **({"resume": resume_session_id} if resume_session_id else {}),
         )

@@ -26,7 +26,7 @@ from ..types import (
     TaskStatus,
 )
 from .callback import deliver_callback, CallbackResult
-from .prompt_engine import render_prompt
+from .prompt_engine import render_prompt, load_prompt_from_disk
 from .sdk_runner import run_agent, SdkResult
 
 log = get_logger()
@@ -77,8 +77,19 @@ async def _process_item(item: QueueItem) -> None:
     task_logs_store.update_status(task_id, TaskStatus.processing)
     log.info("task_processing task_id=%s linkid=%s path=%s", task_id, linkid, interface_path)
 
+    # 从磁盘读取提示词模板（DB 的 prompt 列已废弃）
+    template = load_prompt_from_disk(interface_path)
+    if not template:
+        task_logs_store.update_result(task_id, {
+            "status": TaskStatus.failed,
+            "error_message": "提示词文件不存在: " + interface_path,
+            "finished_at": now_readable(),
+        })
+        log.error("prompt_file_missing task_id=%s linkid=%s path=%s", task_id, linkid, interface_path)
+        return
+
     # 渲染提示词
-    rendered = render_prompt(iface.prompt, body)
+    rendered = render_prompt(template, body)
     task_logs_store.update_result(task_id, {"prompt": rendered})
 
     # 查 sessions 表：同一 linkid 是否有已存在的 session

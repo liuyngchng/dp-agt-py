@@ -13,6 +13,7 @@ dist/
 
 # 构建临时目录 (build.sh 生成，会重新下载/生成)
 deploy/
+build/.last-pip-dir
 
 # 自签 HTTPS 证书（私钥，不提交）
 build/certs/
@@ -22,9 +23,14 @@ data/app.db
 data/app.db-shm
 data/app.db-wal
 data/cfg.yml
+data/secrets.key
 data/logs/
 data/tasks/
 data/mock.json
+
+# CSV 配置（仅保留模板）
+*.csv
+!data/cfg.csv.template
 
 # IDE
 .idea/

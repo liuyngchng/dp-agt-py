@@ -1,16 +1,23 @@
 """
-管理后台 API — 模板管理、模拟操作、任务监控、任务审查、系统设置、用户管理。
+管理后台 API — 模板管理、模拟操作、任务监控、任务审查、系统设置、用户管理、Prompt 配置管理。
 """
 
 from __future__ import annotations
 
+import csv
+import gzip
+import io
 import json
+import re
+import shutil
 import socket
+import tarfile
+import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Request, HTTPException, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Request, HTTPException, Query, UploadFile, File
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 from ..config import Config
 from ..logger import get_logger
@@ -20,11 +27,18 @@ from ..store import (
     users_store,
     sessions_store,
     config_store,
+    prompt_config_store,
     hash_password,
     sanitize_linkid,
+    sync_interfaces_from_prompts,
 )
 from ..time import now_readable
 from ..services.sse_bus import subscribe, unsubscribe, sse_encode
+from ..services.prompt_engine import (
+    rescan_prompts_dir,
+    list_all_prompt_files,
+    load_prompt_from_disk,
+)
 from .auth import get_current_user, _require_api_auth, _require_admin, _validate_password_strength
 from .process import submit_task
 
@@ -138,8 +152,19 @@ def create_admin_router(cfg: Config) -> APIRouter:
     @router.get("/admin/interfaces")
     async def list_interfaces(request: Request):
         await _require_api_auth(request)
-        interfaces = interfaces_store.list()
-        return {"code": 0, "data": [_iface_to_dict(i) for i in interfaces]}
+        all_files = list_all_prompt_files()
+        result = []
+        for pf in all_files:
+            iface = interfaces_store.get_by_path(pf.path)
+            result.append({
+                "id": iface.id if iface else "",
+                "name": pf.name,
+                "path": pf.path,
+                "prompt": pf.content or "",
+                "created_at": iface.created_at if iface else "",
+                "updated_at": iface.updated_at if iface else "",
+            })
+        return {"code": 0, "data": result}
 
     @router.get("/admin/interfaces/{iface_id}")
     async def get_interface(iface_id: str, request: Request):
@@ -147,7 +172,8 @@ def create_admin_router(cfg: Config) -> APIRouter:
         iface = interfaces_store.get(iface_id)
         if not iface:
             raise HTTPException(status_code=404, detail={"code": 1001, "message": "访问路径不存在"})
-        return {"code": 0, "data": _iface_to_dict(iface)}
+        prompt = load_prompt_from_disk(iface.path) or iface.prompt
+        return {"code": 0, "data": {**_iface_to_dict(iface), "prompt": prompt}}
 
     @router.post("/admin/interfaces")
     async def create_interface(request: Request):
@@ -533,4 +559,307 @@ def create_admin_router(cfg: Config) -> APIRouter:
         log.info("admin_delete_user admin=%s target=%s", cu.get("uname") if cu else "?", username)
         return {"code": 0, "message": "已删除"}
 
+    # ═══════════════════════════════════════════════════════════════
+    # Prompt Config — CSV 上传（单向，加密入库，不可下载）
+    # ═══════════════════════════════════════════════════════════════
+
+    # 上传 CSV 文件（key,value,说明 三列）
+    @router.post("/admin/prompt-config/upload-csv")
+    async def upload_csv(request: Request, file: UploadFile = File(...)):
+        await _require_admin(request)
+        if not file.filename:
+            raise HTTPException(status_code=400, detail={"code": 1001, "message": "请选择 CSV 文件"})
+
+        text_bytes = await file.read()
+        text = text_bytes.decode("utf-8").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail={"code": 1001, "message": "CSV 文件为空"})
+
+        rows: list[dict] = []
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = _parse_csv_line(line)
+            if len(parts) < 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": 1001, "message": f"第 {i + 1} 行格式错误，需要至少 key,value 两列: {line}"},
+                )
+            key = parts[0].strip()
+            value = parts[1].strip()
+            note = (parts[2] or "").strip() if len(parts) > 2 else ""
+            # 跳过 CSV 表头行
+            if key == "key" and value == "value":
+                continue
+            if not key or not value:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": 1001, "message": f"第 {i + 1} 行 key 或 value 为空: {line}"},
+                )
+            # 敏感检测：key 以 .token/.key/.secret/.password 或 _token/_key/_secret/_password 结尾
+            is_secret = bool(re.search(r"[._](token|secret|password|key)$", key, re.IGNORECASE))
+            rows.append({"key": key, "value": value, "is_secret": is_secret, "note": note})
+
+        if not rows:
+            raise HTTPException(status_code=400, detail={"code": 1001, "message": "CSV 文件中没有有效数据行"})
+
+        # 替换模式：先清空再批量导入
+        prompt_config_store.clear_all()
+        count = prompt_config_store.import_rows(rows)
+
+        keys = [r["key"] for r in rows]
+        log.info("prompt_config_csv_uploaded count=%d keys=%s", count, keys)
+        return {"code": 0, "data": {"imported": count, "keys": keys}}
+
+    # 下载 CSV 模板
+    @router.get("/admin/prompt-config/template")
+    async def download_template(request: Request):
+        await _require_api_auth(request)
+        csv_content = ""
+        template_path = Path(cfg.sys.data_dir) / "cfg.csv.template"
+        if template_path.exists():
+            try:
+                csv_content = template_path.read_text(encoding="utf-8")
+            except Exception:
+                csv_content = ""
+        if not csv_content:
+            csv_content = "key,value,说明\n"
+        # Add BOM for Excel UTF-8 compatibility
+        return Response(
+            content="﻿" + csv_content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="prompt-config-template.csv"'},
+        )
+
+    # 获取配置列表（value 默认脱敏）
+    @router.get("/admin/prompt-config")
+    async def list_prompt_config(
+        request: Request,
+        reveal: str = Query(default="0"),
+    ):
+        await _require_api_auth(request)
+        reveal_flag = reveal == "1"
+        rows = prompt_config_store.list(reveal_flag)
+        return {"code": 0, "data": {"rows": rows, "count": len(rows)}}
+
+    # 清空配置
+    @router.delete("/admin/prompt-config")
+    async def clear_prompt_config(request: Request):
+        await _require_admin(request)
+        prompt_config_store.clear_all()
+        log.info("prompt_config_cleared")
+        return {"code": 0, "message": "已清空"}
+
+    # ═══════════════════════════════════════════════════════════════
+    # Prompt Tar — 上传 / 下载 / 校验
+    # 支持 .tar / .tar.gz / .tgz / .zip
+    # ═══════════════════════════════════════════════════════════════
+
+    def _strip_top_dir(names: list[str]) -> list[str] | dict:
+        """按要求剥离包内固定的顶级目录 prompts/，不是则报错。"""
+        if not names:
+            return names
+        if all(n.startswith("prompts/") or n == "prompts" for n in names if n):
+            return [n[len("prompts/"):] for n in names if n != "prompts"]
+        actual = {n.split("/")[0] for n in names if "/" in n}
+        return {"error": f"压缩包顶层目录必须为 prompts/，当前为: {', '.join(sorted(actual))}" if actual else "压缩包格式错误"}
+
+    async def _extract_archive(data: bytes, orig_name: str) -> dict:
+        """解压并返回 {filename: content} 或 {"error": msg}。"""
+        result: dict[str, str] = {}
+
+        # ── Zip ──
+        if orig_name.lower().endswith(".zip") or (len(data) >= 2 and data[:2] == b"PK"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    for entry in zf.infolist():
+                        if entry.is_dir():
+                            continue
+                        name = entry.filename.lstrip("./")
+                        if not name.endswith(".md"):
+                            continue
+                        result[name] = zf.read(entry).decode("utf-8")
+            except Exception:
+                return result
+
+            stripped = _strip_top_dir(list(result.keys()))
+            if isinstance(stripped, dict) and "error" in stripped:
+                return stripped  # type: ignore[return-value]
+            return {stripped[i]: result[k] for i, k in enumerate(result.keys())}
+
+        # ── Tar / Tar.gz ──
+        raw = data
+        name_lower = orig_name.lower()
+        if name_lower.endswith(".gz") or name_lower.endswith(".tgz") or (len(data) >= 2 and data[:2] == b"\x1f\x8b"):
+            try:
+                raw = gzip.decompress(data)
+            except Exception:
+                return result
+
+        try:
+            with tarfile.open(fileobj=io.BytesIO(raw)) as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    name = member.name.lstrip("./")
+                    if not name.endswith(".md"):
+                        continue
+                    f = tf.extractfile(member)
+                    if f:
+                        result[name] = f.read().decode("utf-8")
+        except Exception:
+            return result
+
+        stripped = _strip_top_dir(list(result.keys()))
+        if isinstance(stripped, dict) and "error" in stripped:
+            return stripped  # type: ignore[return-value]
+        return {stripped[i]: result[k] for i, k in enumerate(result.keys())}
+
+    @router.post("/admin/prompt-tar/upload")
+    async def upload_tar(request: Request, file: UploadFile = File(...)):
+        await _require_admin(request)
+        if not file.filename:
+            raise HTTPException(status_code=400, detail={"code": 1001, "message": "请选择 .tar / .tar.gz / .tgz / .zip 文件"})
+
+        # 先校验 CSV 已上传
+        if prompt_config_store.count() == 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": 1001, "message": "请先上传 CSV 配置文件（步骤 1），再进行步骤 2"},
+            )
+
+        valid_keys = set(prompt_config_store.list_keys())
+        builtin_keys = {
+            "request.body", "request.linkid", "request.files",
+            "request.form_data", "request.approval_history", "request.callback_url",
+        }
+        valid_keys.update(builtin_keys)
+
+        data = await file.read()
+        files = await _extract_archive(data, file.filename)
+        if not files:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": 1001, "message": "无法解压文件，或包内没有 .md 文件。支持的格式：.tar / .tar.gz / .tgz / .zip"},
+            )
+        if isinstance(files, dict) and "error" in files:
+            raise HTTPException(status_code=400, detail={"code": 1001, "message": files["error"]})
+
+        # 校验占位符
+        errors: list[str] = []
+        for name, content in files.items():
+            placeholders = re.findall(r"\{\{([^}]+)\}\}", content)
+            for ph in placeholders:
+                inner = ph.strip()
+                if inner.startswith("section:") or inner.startswith("request."):
+                    continue
+                if inner not in valid_keys:
+                    errors.append(f"{name}: 占位符 {{{{ {inner} }}}} 未在 CSV 中配置")
+
+        if errors:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": 1001, "message": "占位符校验失败", "data": {"errors": errors}},
+            )
+
+        # 校验通过 → 替换 prompts/ 目录
+        prompts_dir = Path.cwd() / "prompts"
+        if prompts_dir.exists():
+            shutil.rmtree(prompts_dir, ignore_errors=True)
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            dest = prompts_dir / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+
+        # 重新扫描并同步 agent_interfaces 表
+        pfs = rescan_prompts_dir()
+        sync_interfaces_from_prompts([
+            {"filename": pf.filename, "path": pf.path, "name": pf.name}
+            for pf in pfs
+        ])
+
+        file_list = list(files.keys())
+        log.info("prompt_archive_uploaded files=%s", file_list)
+        return {"code": 0, "data": {"files": file_list, "total": len(file_list)}}
+
+    # 下载当前 prompts/ 为 tar.gz
+    @router.get("/admin/prompt-tar/download")
+    async def download_tar(request: Request):
+        await _require_api_auth(request)
+        prompts_dir = Path.cwd() / "prompts"
+        if not prompts_dir.exists():
+            raise HTTPException(status_code=404, detail={"code": 1001, "message": "prompts/ 目录不存在"})
+
+        import io as io_module
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for f in sorted(prompts_dir.rglob("*")):
+                if f.is_file():
+                    arcname = "prompts/" + str(f.relative_to(prompts_dir)).replace("\\", "/")
+                    tf.add(str(f), arcname=arcname, recursive=False)
+
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/gzip",
+            headers={"Content-Disposition": 'attachment; filename="prompts.tar.gz"'},
+        )
+
+    # 预览模板（渲染前的内容）
+    @router.get("/admin/prompt-preview")
+    async def prompt_preview(request: Request):
+        await _require_api_auth(request)
+        prompts_dir = Path.cwd() / "prompts"
+        previews: list[dict] = []
+
+        if prompts_dir.exists():
+            def walk(d: Path, prefix: str) -> None:
+                for entry in sorted(d.iterdir()):
+                    rel = prefix + entry.name
+                    if entry.is_dir():
+                        walk(entry, rel + "/")
+                    elif entry.name.endswith(".md"):
+                        try:
+                            previews.append({
+                                "file": rel,
+                                "raw": entry.read_text(encoding="utf-8"),
+                            })
+                        except Exception:
+                            pass
+            walk(prompts_dir, "")
+
+        return {"code": 0, "data": {"previews": previews}}
+
     return router
+
+
+def _parse_csv_line(line: str) -> list[str]:
+    """简单 CSV 行解析，处理引号包裹的列（支持列内逗号）。"""
+    result: list[str] = []
+    current = ""
+    in_quotes = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if in_quotes:
+            if ch == '"':
+                if i + 1 < len(line) and line[i + 1] == '"':
+                    current += '"'
+                    i += 1  # 跳过转义的双引号
+                else:
+                    in_quotes = False
+            else:
+                current += ch
+        else:
+            if ch == '"':
+                in_quotes = True
+            elif ch == ',':
+                result.append(current)
+                current = ""
+            else:
+                current += ch
+        i += 1
+    result.append(current)
+    return result

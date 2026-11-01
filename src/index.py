@@ -17,8 +17,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import load_config, ensure_dirs, Config
 from .logger import init_logger, get_logger
-from .store import init_store, task_logs_store, sessions_store, config_store, sanitize_linkid
+from .store import init_store, task_logs_store, sessions_store, config_store, sanitize_linkid, sync_interfaces_from_prompts
 from .services.task_queue import init_task_queue, start_recovered_pump
+from .services.prompt_engine import rescan_prompts_dir
 from .routes.health import router as health_router
 from .routes.auth import router as auth_router, build_api_token_dependency
 from .routes.process import create_process_router
@@ -58,6 +59,14 @@ def create_app() -> tuple[FastAPI, Config]:
     # 初始化存储
     init_store(cfg.sys.data_dir)
     log.info("store_ready")
+
+    # 扫描 prompts/ 目录，同步 agent_interfaces 到 DB
+    prompt_files = rescan_prompts_dir()
+    sync_interfaces_from_prompts([
+        {"filename": pf.filename, "path": pf.path, "name": pf.name}
+        for pf in prompt_files
+    ])
+    log.info("interfaces_synced_from_prompts count=%d paths=%s", len(prompt_files), [pf.path for pf in prompt_files])
 
     # 初始化任务队列
     init_task_queue(cfg)

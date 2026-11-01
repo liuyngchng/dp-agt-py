@@ -54,6 +54,7 @@ class LlmConfig:
     timeout_ms: int = 600000
     disable_nonessential_traffic: bool = True
     attribution_header: bool = False
+    auto_mode_server: bool = False
 
 
 @dataclass
@@ -164,6 +165,9 @@ def load_config() -> Config:
             ),
             attribution_header=_env_bool(
                 "CLAUDE_CODE_ATTRIBUTION_HEADER", l.get("attribution_header", False)
+            ),
+            auto_mode_server=_env_bool(
+                "CLAUDE_CODE_AUTO_MODE_SERVER", l.get("auto_mode_server", False)
             ),
         ),
         doc_audit=DocAuditConfig(

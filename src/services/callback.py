@@ -12,6 +12,7 @@ import httpx
 
 from ..config import Config
 from ..logger import get_logger
+from ..store import prompt_config_store
 
 log = get_logger()
 
@@ -61,7 +62,12 @@ async def deliver_callback(
     """投递回调，重试最多 N 次（指数退避）。"""
     max_retries = cfg.sys.callback_retries
     base_interval = cfg.sys.callback_retry_interval_sec
-    token = cfg.sys.file_url_token or None
+    token = (
+        prompt_config_store.get_plain("doc.file_url_token")
+        or prompt_config_store.get_plain("sys.file_url_token")
+        or cfg.sys.file_url_token
+        or None
+    )
     body_str = json.dumps(payload, ensure_ascii=False, default=str)
 
     body_esc = body_str.replace("'", "'\\''")
